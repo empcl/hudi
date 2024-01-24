@@ -22,7 +22,9 @@ import org.apache.hudi.adapter.OperatorCoordinatorAdapter;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.config.SerializableConfiguration;
+import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.model.TableServiceType;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
@@ -52,6 +54,8 @@ import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.operators.coordination.TaskNotRunningException;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,6 +75,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.configuration.FlinkOptions.CLUSTERING_ASYNC_ENABLED;
 import static org.apache.hudi.util.StreamerUtil.initTableIfNotExists;
 
 /**
@@ -191,6 +196,7 @@ public class StreamWriteOperatorCoordinator
     // the write client must create after the table creation
     this.writeClient = FlinkWriteClients.createWriteClient(conf);
     this.ckpMetadata = initCkpMetadata(writeClient.getConfig(), this.conf);
+    initAndDeTableServiceTag();
     initMetadataTable(this.writeClient);
     this.tableState = TableState.create(conf);
     // start the executor
@@ -204,6 +210,28 @@ public class StreamWriteOperatorCoordinator
     // start client id heartbeats for optimistic concurrency control
     if (OptionsResolver.isMultiWriter(conf)) {
       initClientIds(conf);
+    }
+  }
+
+  /**
+   * If the service is enabled, a file identifier needs to be created.
+   * If the service has been shut down and there is an identification file, it needs to be deleted.
+   */
+  private void initAndDeTableServiceTag() throws IOException {
+    boolean clusteringAsyncEnabled = conf.getBoolean(CLUSTERING_ASYNC_ENABLED);
+    initAndDeTableServiceTagInternal(clusteringAsyncEnabled, TableServiceType.CLUSTER);
+  }
+
+  private void initAndDeTableServiceTagInternal(boolean tableServiceEnabled, TableServiceType type) throws IOException {
+    String auxPath = metaClient.getMetaAuxiliaryPath();
+    FileSystem fs = FSUtils.getFs(metaClient.getBasePathV2(), HadoopConfigurations.getHadoopConf(conf));
+    Path tag = new Path(auxPath + "/" + type.toString().toLowerCase() + "_open_tag");
+    boolean tagExists = fs.exists(tag);
+
+    if (tableServiceEnabled && !tagExists) {
+      fs.create(tag);
+    } else if (!tableServiceEnabled && tagExists) {
+      fs.delete(tag, true);
     }
   }
 

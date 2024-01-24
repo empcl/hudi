@@ -182,6 +182,10 @@ public class HoodieClusteringConfig extends HoodieConfig {
       .sinceVersion("0.11.0")
       .withDocumentation(ClusteringPlanPartitionFilterMode.class);
 
+  /*
+   * LEARN CODE RECORD：
+   * 每一个 group 最大接受的数据量
+   */
   public static final ConfigProperty<String> PLAN_STRATEGY_MAX_BYTES_PER_OUTPUT_FILEGROUP = ConfigProperty
       .key(CLUSTERING_STRATEGY_PARAM_PREFIX + "max.bytes.per.group")
       .defaultValue(String.valueOf(2 * 1024 * 1024 * 1024L))

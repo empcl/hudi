@@ -22,37 +22,55 @@ import org.apache.hudi.avro.model.HoodieClusteringGroup;
 import org.apache.hudi.avro.model.HoodieClusteringPlan;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.data.HoodieListData;
+import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.TableServiceType;
 import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.CommitUtils;
+import org.apache.hudi.common.util.MarkerUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.configuration.FlinkOptions;
+import org.apache.hudi.configuration.HadoopConfigurations;
 import org.apache.hudi.exception.HoodieClusteringException;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.metrics.FlinkClusteringMetrics;
 import org.apache.hudi.sink.CleanFunction;
+import org.apache.hudi.sink.utils.InstantUtil;
 import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.table.action.HoodieWriteMetadata;
 import org.apache.hudi.util.ClusteringUtil;
 import org.apache.hudi.util.FlinkWriteClients;
 
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
+
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.REPLACE_COMMIT_ACTION;
+import static org.apache.hudi.sink.utils.InstantUtil.EXCLUDE_TABLE_SERVICE_ACTION;
 
 /**
  * Function to check and commit the clustering action.
@@ -92,9 +110,24 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
 
   private transient FlinkClusteringMetrics clusteringMetrics;
 
+  /**
+   * The completed and latest instant time when generating a clustering plan
+   */
+  private final String latestInstantBeforeClusteringPlan;
+
+  /**
+   * There is a conflict between the current clustering task and the writer task
+   */
+  private transient boolean hasConflict;
+
   public ClusteringCommitSink(Configuration conf) {
+    this(conf, null);
+  }
+
+  public ClusteringCommitSink(Configuration conf, String latestInstantBeforeClusteringPlan) {
     super(conf);
     this.conf = conf;
+    this.latestInstantBeforeClusteringPlan = latestInstantBeforeClusteringPlan;
   }
 
   @Override
@@ -140,17 +173,21 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
       return;
     }
 
-    if (events.stream().anyMatch(ClusteringCommitEvent::isFailed)) {
+    if (events.stream().anyMatch(ClusteringCommitEvent::isFailed)
+        || conflictDetectionInClusteringAndWriter(instant, events)) {
       try {
         // handle failure case
         ClusteringUtil.rollbackClustering(table, writeClient, instant);
+
+        if (hasConflict) {
+          cleanClusteringInstant(instant);
+        }
       } finally {
         // remove commitBuffer to avoid obsolete metadata commit
         reset(instant);
       }
       return;
     }
-
     try {
       doCommit(instant, clusteringPlan, events);
     } catch (Throwable throwable) {
@@ -160,6 +197,153 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
       // reset the status
       reset(instant);
     }
+  }
+
+  /**
+   * Cleaning up clustering instant
+   *
+   * @param instantTime clustering instant time
+   */
+  private void cleanClusteringInstant(String instantTime) {
+    BiConsumer<FileSystem, Path> DELETE_HOODIE_CLUSTERING_INSTANT = (fs, instant) -> {
+      try {
+        if (fs.exists(instant)) {
+          fs.delete(instant, true);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("cleaning up clustering instant failed." ,e);
+      }
+    };
+
+    HoodieTableMetaClient metaClient = writeClient.getHoodieTable().getMetaClient();
+    String metaPath = metaClient.getMetaPath();
+
+    FileSystem fs = FSUtils.getFs(metaClient.getBasePathV2(), HadoopConfigurations.getHadoopConf(conf));
+    HoodieInstant requestInstant = new HoodieInstant(HoodieInstant.State.REQUESTED, REPLACE_COMMIT_ACTION, instantTime);
+    HoodieInstant inflightInstant = new HoodieInstant(HoodieInstant.State.INFLIGHT, REPLACE_COMMIT_ACTION, instantTime);
+
+    DELETE_HOODIE_CLUSTERING_INSTANT.accept(fs, new Path(metaPath, requestInstant.getFileName()));
+    DELETE_HOODIE_CLUSTERING_INSTANT.accept(fs, new Path(metaPath, inflightInstant.getFileName()));
+
+    LOG.info("Cleaning up clustering instant completed, clustering instant : {}", instantTime);
+  }
+
+  // conflict detection between clustering and writer
+  private boolean conflictDetectionInClusteringAndWriter(String clusteringInstant, Collection<ClusteringCommitEvent> events) {
+    // The writer task should not perform conflict detection operations
+    if (latestInstantBeforeClusteringPlan == null) {
+      return false;
+    }
+
+    // step1 the file id involved in this clustering
+    Set<String> clusteringFileIdSet = Arrays.stream(events.stream().map(ClusteringCommitEvent::getFileIds)
+            .collect(Collectors.joining(","))
+            .split(","))
+        .collect(Collectors.toSet());
+
+    // step2 the committed files generated by the writer during the clustering operation
+    HoodieTableMetaClient metaClient = writeClient.getHoodieTable().getMetaClient();
+    HoodieTimeline activeTimeline = metaClient
+        .reloadActiveTimeline().findInstantsAfter(latestInstantBeforeClusteringPlan);
+    Set<HoodieCommitMetadata> commitMetadataList = activeTimeline.filterCompletedInstants().getWriteTimeline()
+        .filter(EXCLUDE_TABLE_SERVICE_ACTION).getInstants().stream()
+        .map(instant -> {
+          try {
+            return HoodieCommitMetadata.fromBytes(activeTimeline.getInstantDetails(instant).get(), HoodieCommitMetadata.class);
+          } catch (IOException e) {
+            throw new RuntimeException(e);
+          }
+        })
+        .collect(Collectors.toSet());
+    Set<String> incrementalFileIds = commitMetadataList.stream()
+        .filter(metadata -> !metadata.getPartitionToWriteStats().isEmpty())
+        .map(HoodieCommitMetadata::getFileIdAndRelativePaths)
+        .collect(Collectors.toSet())
+        .stream()
+        .flatMap(m -> m.entrySet().stream())
+        .map(Map.Entry::getKey).collect(Collectors.toSet());
+
+    // step3 the uncommitted files(marker file) generated by the writer during the clustering operation
+    incrementalFileIds.addAll(getAllMarkerOrIncrementalFiles(metaClient, clusteringInstant));
+
+    // step4 has conflict in clustering and writer task
+    Tuple2<Boolean, List<String>> conflictRes = hashConflict(clusteringFileIdSet, incrementalFileIds);
+
+    if (conflictRes.f0) {
+      hasConflict = true;
+      LOG.warn("Cannot resolve conflicts for overlapping writes, clustering instant: {}, overlapping file ids: {}",
+          clusteringInstant, conflictRes.f1);
+    }
+
+    return conflictRes.f0;
+  }
+
+  private Tuple2<Boolean, List<String>> hashConflict(Set<String> clusteringFileIds, Set<String> incrementalFileIds) {
+    clusteringFileIds.retainAll(incrementalFileIds);
+    if (clusteringFileIds.isEmpty()) {
+      return Tuple2.of(false, new ArrayList<>());
+    } else {
+      return Tuple2.of(true, new ArrayList<>(clusteringFileIds));
+    }
+  }
+
+  private Set<String> getAllMarkerOrIncrementalFiles(HoodieTableMetaClient metaClient, String clusteringInstant) {
+    try {
+      Path tempPath = new Path(metaClient.getBasePathV2() + Path.SEPARATOR + HoodieTableMetaClient.TEMPFOLDER_NAME);
+      Set<String> markerFiles = MarkerUtils.getAllMarkerDir(tempPath, metaClient.getFs())
+          .stream()
+          .map(Path::toString)
+          .filter(string -> !string.contains(clusteringInstant))
+          .flatMap(markerTempPath -> getAllMarkerFileSpecifyPartition(metaClient.getFs(), new Path(markerTempPath)).stream())
+          .collect(Collectors.toSet());
+
+      if (!markerFiles.isEmpty()) {
+        return parseFileIdFromMarker(markerFiles);
+      }
+
+      metaClient.reloadActiveTimeline();
+      Optional<HoodieInstant> nextCompletedInstantOption = metaClient.getActiveTimeline()
+          .filterCompletedInstants().filter(EXCLUDE_TABLE_SERVICE_ACTION).getReverseOrderedInstants().findFirst();
+      if (nextCompletedInstantOption.isPresent()) {
+        return new HashSet<>(HoodieCommitMetadata
+            .fromBytes(metaClient.getActiveTimeline().getInstantDetails(nextCompletedInstantOption.get()).get(), HoodieCommitMetadata.class)
+            .getFileIdAndRelativePaths().keySet());
+      } else {
+        throw new IllegalStateException("this shouldn't happen here.");
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private Set<String> parseFileIdFromMarker(Set<String> markerFiles) {
+    Set<String> set = new HashSet<>();
+    for (String mf : markerFiles) {
+      set.add(InstantUtil.getFileIdFromFile(mf));
+    }
+
+    return set;
+  }
+
+
+  public static List<String> getAllMarkerFileSpecifyPartition(FileSystem fs, Path path) {
+    List<String> statuses = new ArrayList<>();
+    try {
+      for (FileStatus status : fs.listStatus(path)) {
+        if (status.getPath().toString().contains(HoodieTableMetaClient.TEMPFOLDER_NAME)) {
+          if (status.isDirectory()) {
+            statuses.addAll(getAllMarkerFileSpecifyPartition(fs, status.getPath()));
+          } else {
+            statuses.add(status.getPath().toString());
+          }
+        }
+      }
+    } catch (IOException e) {
+      // if an exception occurs during the traversal of the marker file,
+      // it indicates that the current marker file has been deleted due to an instant commit
+      return new ArrayList<>();
+    }
+    return statuses;
   }
 
   private void doCommit(String instant, HoodieClusteringPlan clusteringPlan, Collection<ClusteringCommitEvent> events) {
@@ -191,7 +375,7 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
           Option.empty(),
           WriteOperationType.CLUSTER,
           this.writeClient.getConfig().getSchema(),
-          HoodieTimeline.REPLACE_COMMIT_ACTION);
+          REPLACE_COMMIT_ACTION);
       writeMetadata.setCommitMetadata(Option.of(commitMetadata));
     }
     // commit the clustering
@@ -202,8 +386,11 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
     clusteringMetrics.updateCommitMetrics(instant, writeMetadata.getCommitMetadata().get());
     // whether to clean up the input base parquet files used for clustering
     if (!conf.getBoolean(FlinkOptions.CLEAN_ASYNC_ENABLED) && !isCleaning) {
-      LOG.info("Running inline clean");
-      this.writeClient.clean();
+      // clustering jobs should not proactively execute the clean method
+      if (latestInstantBeforeClusteringPlan == null) {
+        LOG.info("Running inline clean");
+        this.writeClient.clean();
+      }
     }
   }
 

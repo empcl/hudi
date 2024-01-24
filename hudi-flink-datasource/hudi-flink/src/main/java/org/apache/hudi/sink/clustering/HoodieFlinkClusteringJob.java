@@ -19,8 +19,10 @@
 package org.apache.hudi.sink.clustering;
 
 import org.apache.hudi.async.HoodieAsyncTableService;
+import org.apache.hudi.avro.model.HoodieClusteringGroup;
 import org.apache.hudi.avro.model.HoodieClusteringPlan;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
+import org.apache.hudi.common.fs.HoodieWrapperFileSystem;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
@@ -31,6 +33,7 @@ import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.sink.compact.HoodieFlinkCompactor;
+import org.apache.hudi.sink.utils.InstantUtil;
 import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.util.AvroSchemaConverter;
 import org.apache.hudi.util.ClusteringUtil;
@@ -49,13 +52,17 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 /**
  * Flink hudi clustering program that can be executed manually.
@@ -88,6 +95,9 @@ public class HoodieFlinkClusteringJob {
    * Main method to start clustering service.
    */
   public void start(boolean serviceMode) throws Exception {
+    if (!preValidate()) {
+      return;
+    }
     if (serviceMode) {
       clusteringScheduleService.start(null);
       try {
@@ -115,6 +125,22 @@ public class HoodieFlinkClusteringJob {
         LOG.info("Shut down hoodie flink clustering");
       }
     }
+  }
+
+  /**
+   * If the clustering parameter is enabled for the write task, the clusteringJob will not schedule and execute.
+   */
+  private boolean preValidate() throws IOException {
+    HoodieTableMetaClient metaClient = clusteringScheduleService.metaClient;
+    HoodieWrapperFileSystem fs = metaClient.getFs();
+    Path auxPath = new Path(metaClient.getMetaAuxiliaryPath());
+    Path clusterTagPath = new Path(auxPath + "/cluster_open_tag");
+    if (fs.exists(auxPath) && fs.exists(clusterTagPath)) {
+      LOG.info("Due to the clustering parameter being enabled for the write task, " +
+          "the Hoodie Clustering Job will not be schedule and executed.");
+      return false;
+    }
+    return true;
   }
 
   public static FlinkClusteringConfig getFlinkClusteringConfig(String[] args) {
@@ -308,6 +334,7 @@ public class HoodieFlinkClusteringJob {
         return;
       }
 
+      String latestInstant = getLatestInstantFromClusteringPlan(clusteringPlan);
       HoodieInstant instant = HoodieTimeline.getReplaceCommitRequestedInstant(clusteringInstant.getTimestamp());
 
       int inputGroupSize = clusteringPlan.getInputGroups().size();
@@ -345,7 +372,7 @@ public class HoodieFlinkClusteringJob {
       }
 
       dataStream
-          .addSink(new ClusteringCommitSink(conf))
+          .addSink(new ClusteringCommitSink(conf, latestInstant))
           .name("clustering_commit")
           .uid("uid_clustering_commit")
           .setParallelism(1)
@@ -353,6 +380,25 @@ public class HoodieFlinkClusteringJob {
           .setMaxParallelism(1);
 
       env.execute("flink_hudi_clustering_" + clusteringInstant.getTimestamp());
+    }
+
+    /**
+     * Parse the latest instant from the clustering plan
+     * @param clusteringPlan clustering plan
+     * @return latest instant
+     */
+    private String getLatestInstantFromClusteringPlan(HoodieClusteringPlan clusteringPlan) {
+      List<Pair<String, List<String>>> clusteringFiles = new ArrayList<>(clusteringPlan.getInputGroups()).stream()
+          .map(HoodieClusteringGroup::getSlices)
+          .collect(Collectors.toList()).stream()
+          .flatMap(List::stream)
+          .map(sliceInfo -> Pair.of(sliceInfo.getDataFilePath(), sliceInfo.getDeltaFilePaths()))
+          .sorted(InstantUtil.SLICE_COMPARATOR_REVERSE)
+          .collect(Collectors.toList());
+      assert clusteringFiles.size() != 0;
+      Pair<String, List<String>> clusteringFile = clusteringFiles.get(0);
+      return clusteringFile.getKey() != null ?
+          InstantUtil.getInstantTimeFromFile(clusteringFile.getKey()) : InstantUtil.getInstantTimeFromFile(clusteringFile.getValue().get(0));
     }
 
     /**
