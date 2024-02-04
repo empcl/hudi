@@ -26,10 +26,12 @@ import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.TableServiceType;
 import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.CommitUtils;
+import org.apache.hudi.common.util.MarkerUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.configuration.FlinkOptions;
@@ -37,6 +39,7 @@ import org.apache.hudi.exception.HoodieClusteringException;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.metrics.FlinkClusteringMetrics;
 import org.apache.hudi.sink.CleanFunction;
+import org.apache.hudi.sink.utils.InstantUtil;
 import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.table.action.HoodieWriteMetadata;
 import org.apache.hudi.util.ClusteringUtil;
@@ -44,15 +47,22 @@ import org.apache.hudi.util.FlinkWriteClients;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static org.apache.hudi.sink.utils.InstantUtil.EXCLUDE_TABLE_SERVICE_ACTION;
 
 /**
  * Function to check and commit the clustering action.
@@ -92,9 +102,19 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
 
   private transient FlinkClusteringMetrics clusteringMetrics;
 
+  /**
+   * The completed and latest instant time when generating a clustering plan
+   */
+  private final String latestInstantBeforeClusteringPlan;
+
   public ClusteringCommitSink(Configuration conf) {
+    this(conf, null);
+  }
+
+  public ClusteringCommitSink(Configuration conf, String latestInstantBeforeClusteringPlan) {
     super(conf);
     this.conf = conf;
+    this.latestInstantBeforeClusteringPlan = latestInstantBeforeClusteringPlan;
   }
 
   @Override
@@ -140,7 +160,7 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
       return;
     }
 
-    if (events.stream().anyMatch(ClusteringCommitEvent::isFailed)) {
+    if (events.stream().anyMatch(ClusteringCommitEvent::isFailed) || conflictDetectionInClusteringAndWriter(instant, events)) {
       try {
         // handle failure case
         ClusteringUtil.rollbackClustering(table, writeClient, instant);
@@ -160,6 +180,84 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
       // reset the status
       reset(instant);
     }
+  }
+
+  // conflict detection between clustering and writer
+  private boolean conflictDetectionInClusteringAndWriter(String clusteringInstant, Collection<ClusteringCommitEvent> events) {
+    String clusteredFiledIds = events.stream().map(ClusteringCommitEvent::getFileIds)
+        .collect(Collectors.joining(","));
+
+    HoodieTableMetaClient metaClient = writeClient.getHoodieTable().getMetaClient();
+    HoodieTimeline activeTimeline = metaClient
+        .reloadActiveTimeline().findInstantsAfter(latestInstantBeforeClusteringPlan);
+    List<HoodieCommitMetadata> commitMetadataList = activeTimeline.filterCompletedInstants()
+        .filter(EXCLUDE_TABLE_SERVICE_ACTION).getInstants().stream()
+        .map(instant -> {
+          try {
+            return HoodieCommitMetadata.fromBytes(activeTimeline.getInstantDetails(instant).get(), HoodieCommitMetadata.class);
+          } catch (IOException e) {
+            throw new RuntimeException(e);
+          }
+        })
+        .collect(Collectors.toList());
+    List<String> incrementalFileIds = commitMetadataList.stream()
+        .filter(metadata -> !metadata.getPartitionToWriteStats().isEmpty())
+        .map(HoodieCommitMetadata::getFileIdAndRelativePaths)
+        .collect(Collectors.toList())
+        .stream()
+        .flatMap(m -> m.entrySet().stream())
+        .map(Map.Entry::getKey).collect(Collectors.toList());
+
+    incrementalFileIds.addAll(getAllMarkerFiles(metaClient, clusteringInstant));
+
+    return false;
+  }
+
+  private Collection<String> getAllMarkerFiles(HoodieTableMetaClient metaClient, String clusteringInstant) {
+    try {
+      Path tempPath = new Path(metaClient.getBasePathV2() + Path.SEPARATOR + HoodieTableMetaClient.TEMPFOLDER_NAME);
+      List<String> markerFiles = MarkerUtils.getAllMarkerDir(tempPath, metaClient.getFs())
+          .stream()
+          .map(Path::toString)
+          .filter(string -> !string.contains(clusteringInstant))
+          .flatMap(markerTempPath -> getAllMarkerFileSpecifyPartition(metaClient.getFs(), new Path(markerTempPath)).stream())
+          .collect(Collectors.toList());
+
+      return markerFiles;
+    } catch (IOException e) {
+
+    }
+
+    metaClient.reloadActiveTimeline();
+    HoodieInstant lastCompletedInstant = metaClient.getActiveTimeline().
+        filterCompletedInstants().filter(EXCLUDE_TABLE_SERVICE_ACTION).getReverseOrderedInstants().findFirst().get();
+
+    try {
+      HoodieCommitMetadata metadata = HoodieCommitMetadata.fromBytes(metaClient.getActiveTimeline().getInstantDetails(lastCompletedInstant).get(), HoodieCommitMetadata.class);
+      List<String> collect = metadata.getFileIdAndRelativePaths().entrySet().stream().map(Map.Entry::getKey).collect(Collectors.toList());
+      return collect;
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+
+  public static List<String> getAllMarkerFileSpecifyPartition(FileSystem fs, Path path) {
+    List<String> statuses = new ArrayList<>();
+    try {
+      for (FileStatus status : fs.listStatus(path)) {
+        if (status.getPath().toString().contains(HoodieTableMetaClient.TEMPFOLDER_NAME)) {
+          if (status.isDirectory()) {
+            statuses.addAll(getAllMarkerFileSpecifyPartition(fs, status.getPath()));
+          } else {
+            statuses.add(status.getPath().toString());
+          }
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+    return statuses;
   }
 
   private void doCommit(String instant, HoodieClusteringPlan clusteringPlan, Collection<ClusteringCommitEvent> events) {

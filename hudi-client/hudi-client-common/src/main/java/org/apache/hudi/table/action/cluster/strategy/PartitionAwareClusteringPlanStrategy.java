@@ -54,6 +54,8 @@ public abstract class PartitionAwareClusteringPlanStrategy<T,I,K,O> extends Clus
 
   /**
    * Create Clustering group based on files eligible for clustering in the partition.
+   * LEARN CODE RECORD：
+   * 每个分区中 HoodieClusteringGroup 的情况
    */
   protected Stream<HoodieClusteringGroup> buildClusteringGroupsForPartition(String partitionPath, List<FileSlice> fileSlices) {
     HoodieWriteConfig writeConfig = getWriteConfig();
@@ -73,6 +75,7 @@ public abstract class PartitionAwareClusteringPlanStrategy<T,I,K,O> extends Clus
       long currentSize = currentSlice.getBaseFile().isPresent() ? currentSlice.getBaseFile().get().getFileSize() : writeConfig.getParquetMaxFileSize();
       // check if max size is reached and create new group, if needed.
       if (totalSizeSoFar + currentSize > writeConfig.getClusteringMaxBytesInGroup() && !currentGroup.isEmpty()) {
+        // 这一批 currentGroup 能重写出 filegroup 的个数
         int numOutputGroups = getNumberOfOutputFileGroups(totalSizeSoFar, writeConfig.getClusteringTargetFileMaxBytes());
         LOG.info("Adding one clustering group " + totalSizeSoFar + " max bytes: "
             + writeConfig.getClusteringMaxBytesInGroup() + " num input slices: " + currentGroup.size() + " output groups: " + numOutputGroups);
@@ -153,7 +156,15 @@ public abstract class PartitionAwareClusteringPlanStrategy<T,I,K,O> extends Clus
         .flatMap(
             partitionPaths,
             partitionPath -> {
+              /*
+               * LEARN CODE RECORD：
+               * 每个file group 中最新的 fileslice的集合
+               */
               List<FileSlice> fileSlicesEligible = getFileSlicesEligibleForClustering(partitionPath).collect(Collectors.toList());
+              /*
+               * LEARN CODE RECORD：
+               *
+               */
               return buildClusteringGroupsForPartition(partitionPath, fileSlicesEligible).limit(getWriteConfig().getClusteringMaxNumGroups());
             },
             partitionPaths.size())
