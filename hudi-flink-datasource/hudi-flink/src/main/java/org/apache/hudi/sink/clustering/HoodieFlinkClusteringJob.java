@@ -28,6 +28,7 @@ import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsResolver;
@@ -397,7 +398,7 @@ public class HoodieFlinkClusteringJob {
           .collect(Collectors.toList());
       assert clusteringFiles.size() != 0;
       Pair<String, List<String>> clusteringFile = clusteringFiles.get(0);
-      return clusteringFile.getKey() != null ?
+      return StringUtils.emptyToNull(clusteringFile.getKey()) != null ?
           InstantUtil.getInstantTimeFromFile(clusteringFile.getKey()) : InstantUtil.getInstantTimeFromFile(clusteringFile.getValue().get(0));
     }
 

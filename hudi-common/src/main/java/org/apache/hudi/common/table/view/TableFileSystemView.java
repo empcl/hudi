@@ -108,7 +108,6 @@ public interface TableFileSystemView {
     Stream<FileSlice> getLatestFileSlices(String partitionPath);
 
     /**
-     * TODO 问题：为什么只需要最新的？而不是全部的？
      * Stream all the latest file slices in the given partition
      * without caching the file group mappings.
      *

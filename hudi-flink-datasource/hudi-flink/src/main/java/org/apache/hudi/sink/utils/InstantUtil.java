@@ -3,6 +3,7 @@ package org.apache.hudi.sink.utils;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.collection.Pair;
 
 import java.util.Comparator;
@@ -19,8 +20,8 @@ public class InstantUtil {
    */
   public static final Comparator<? super Pair<String, List<String>>> SLICE_COMPARATOR_REVERSE =
       (Comparator<Pair<String, List<String>>>) (o1, o2) -> {
-        String f1 = o1.getLeft() != null ? o1.getLeft() : o1.getRight().get(0);
-        String f2 = o2.getLeft() != null ? o2.getLeft() : o2.getRight().get(0);
+        String f1 = StringUtils.emptyToNull(o1.getLeft()) != null ? o1.getLeft() : o1.getRight().get(0);
+        String f2 = StringUtils.emptyToNull(o2.getLeft()) != null ? o2.getLeft() : o2.getRight().get(0);
         return getInstantTimeFromFile(f2).compareTo(getInstantTimeFromFile(f1));
       };
 
