@@ -40,7 +40,9 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType}
 import org.apache.spark.sql.connector.catalog.TableChange.{AddColumn, DeleteColumn, RemoveProperty, SetProperty}
 import org.apache.spark.sql.connector.catalog.{TableCatalog, TableChange}
 import org.apache.spark.sql.execution.command.RunnableCommand
+import org.apache.spark.sql.hive.HiveClientUtils
 import org.apache.spark.sql.hudi.HoodieOptionConfig
+import org.apache.spark.sql.internal.StaticSQLConf.SCHEMA_STRING_LENGTH_THRESHOLD
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.{Row, SparkSession}
 
@@ -49,6 +51,7 @@ import java.nio.charset.StandardCharsets
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.util.control.NonFatal
 
 // TODO: we should remove this file when we support datasourceV2 for hoodie on spark3.0.x
@@ -112,6 +115,35 @@ case class Spark30AlterTableCommand(table: CatalogTable, changes: Seq[TableChang
     } else {
       historySchema
     }
+
+    val threshold = sparkSession.conf.get(SCHEMA_STRING_LENGTH_THRESHOLD)
+    val schemaJsonString = SparkInternalSchemaConverter.constructSparkSchemaFromInternalSchema(oldSchema).json
+    // Split the JSON string.
+    val parts = schemaJsonString.grouped(threshold).toSeq
+
+    val properties = new mutable.HashMap[String, String]
+
+    val SPARK_SQL_PREFIX = "1.spark.sql."
+    val DATASOURCE_PREFIX = SPARK_SQL_PREFIX + "sources."
+    val DATASOURCE_SCHEMA = DATASOURCE_PREFIX + "schema"
+    val DATASOURCE_SCHEMA_PREFIX = DATASOURCE_SCHEMA + "."
+    val DATASOURCE_SCHEMA_PART_PREFIX = DATASOURCE_SCHEMA_PREFIX + "part."
+
+    properties.put(DATASOURCE_SCHEMA_PREFIX + "numParts", parts.size.toString)
+    parts.zipWithIndex.foreach { case (part, index) =>
+      properties.put(s"$DATASOURCE_SCHEMA_PART_PREFIX$index", part)
+    }
+
+    val path = Spark30AlterTableCommand.getTableLocation(table, sparkSession)
+    val hadoopConf = sparkSession.sessionState.newHadoopConf()
+    val metaClient = HoodieTableMetaClient.builder().setBasePath(path)
+      .setConf(hadoopConf).build()
+
+    val tableName = metaClient.getTableConfig.getTableName
+    val propertiesStr = properties.map { case (k, v) => s"'$k'='$v'" }.mkString(", ")
+    sparkSession.sql(s"ALTER TABLE source1.$tableName SET TBLPROPERTIES ($propertiesStr)")
+
+
     Spark30AlterTableCommand.commitWithSchema(newSchema, verifiedHistorySchema, table, sparkSession)
     logInfo("column delete finished")
   }

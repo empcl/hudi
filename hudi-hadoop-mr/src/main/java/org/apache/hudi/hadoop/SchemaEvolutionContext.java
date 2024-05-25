@@ -35,15 +35,20 @@ import org.apache.hudi.internal.schema.Types;
 import org.apache.hudi.internal.schema.action.InternalSchemaMerger;
 import org.apache.hudi.internal.schema.convert.AvroInternalSchemaConverter;
 import org.apache.hudi.internal.schema.utils.InternalSchemaUtils;
+import org.apache.hudi.internal.schema.utils.SerDeHelper;
 import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.storage.HoodieStorage;
 import org.apache.hudi.storage.HoodieStorageUtils;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.ql.exec.SerializationUtilities;
+import org.apache.hadoop.hive.ql.metadata.Hive;
+import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
@@ -101,8 +106,26 @@ public class SchemaEvolutionContext {
       return;
     }
     try {
+
       TableSchemaResolver schemaUtil = new TableSchemaResolver(metaClient);
-      this.internalSchemaOption = schemaUtil.getTableInternalSchemaFromCommitMetadata();
+      Hive hive = Hive.get();
+      String tableName = "hudi_mor_upsert_sc_7";
+      Table table = hive.getTable("source1", tableName);
+      Map<String, String> parameters = table.getTTable().getParameters();
+      String k = "1.spark.sql.sources.schema.part.0";
+      String value = parameters.get(k);
+      // TODO 重构schema str 到internal schema的逻辑
+      // 注意：integer -> int
+      // 必要的几个元素：
+      //    name / id / type / optional
+      value = value.replaceAll("struct", "record");
+      value = "{\"type\":\"record\",\"fields\":[{\"name\":\"_hoodie_commit_time\",\"id\":\"0\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_commit_seqno\",\"id\":\"1\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_record_key\",\"id\":\"2\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_partition_path\",\"id\":\"3\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_file_name\",\"id\":\"4\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"id\",\"type\":\"int\",\"id\":\"5\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"name\",\"type\":\"string\",\"id\":\"6\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"age\",\"type\":\"string\",\"id\":\"7\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"f1\",\"type\":\"string\",\"id\":\"8\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"f2\",\"type\":\"string\",\"id\":\"9\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"ts\",\"type\":\"long\",\"id\":\"10\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"sex\",\"type\":\"int\",\"id\":\"11\",\"nullable\":true,\"optional\":true,\"metadata\":{}}]}";
+      ObjectMapper mapper = new ObjectMapper();
+      JsonNode jsonNode = mapper.readTree(value);
+      InternalSchema internalSchema = SerDeHelper.fromJson(jsonNode);
+      this.internalSchemaOption = Option.of(internalSchema);
+
+//      this.internalSchemaOption = schemaUtil.getTableInternalSchemaFromCommitMetadata();
     } catch (Exception e) {
       internalSchemaOption = Option.empty();
       LOG.warn(String.format("failed to get internal Schema from hudi table：%s", metaClient.getBasePathV2()), e);
