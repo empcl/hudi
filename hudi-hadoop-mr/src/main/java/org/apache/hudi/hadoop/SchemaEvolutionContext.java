@@ -21,6 +21,7 @@ package org.apache.hudi.hadoop;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.TableSchemaResolver;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.InternalSchemaCache;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.StringUtils;
@@ -42,13 +43,15 @@ import org.apache.hudi.storage.HoodieStorageUtils;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import org.apache.avro.Schema;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.ql.exec.SerializationUtilities;
-import org.apache.hadoop.hive.ql.metadata.Hive;
-import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
@@ -70,10 +73,16 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
+
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.SCHEMA_COMMIT_ACTION;
+import static org.apache.hudi.hadoop.utils.HoodieHiveUtils.readMaxCommits;
+import static org.apache.hudi.hadoop.utils.HoodieHiveUtils.readStartCommitTime;
 
 /**
  * This class is responsible for calculating names and types of fields that are actual at a certain point in time for hive.
@@ -106,31 +115,95 @@ public class SchemaEvolutionContext {
       return;
     }
     try {
-
-      TableSchemaResolver schemaUtil = new TableSchemaResolver(metaClient);
-      Hive hive = Hive.get();
-      String tableName = "hudi_mor_upsert_sc_7";
-      Table table = hive.getTable("source1", tableName);
-      Map<String, String> parameters = table.getTTable().getParameters();
-      String k = "1.spark.sql.sources.schema.part.0";
-      String value = parameters.get(k);
-      // TODO 重构schema str 到internal schema的逻辑
-      // 注意：integer -> int
-      // 必要的几个元素：
-      //    name / id / type / optional
-      value = value.replaceAll("struct", "record");
-      value = "{\"type\":\"record\",\"fields\":[{\"name\":\"_hoodie_commit_time\",\"id\":\"0\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_commit_seqno\",\"id\":\"1\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_record_key\",\"id\":\"2\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_partition_path\",\"id\":\"3\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"_hoodie_file_name\",\"id\":\"4\",\"type\":\"string\",\"nullable\":true,\"optional\":true,\"metadata\":{\"comment\":\"\"}},{\"name\":\"id\",\"type\":\"int\",\"id\":\"5\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"name\",\"type\":\"string\",\"id\":\"6\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"age\",\"type\":\"string\",\"id\":\"7\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"f1\",\"type\":\"string\",\"id\":\"8\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"f2\",\"type\":\"string\",\"id\":\"9\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"ts\",\"type\":\"long\",\"id\":\"10\",\"nullable\":true,\"optional\":true,\"metadata\":{}},{\"name\":\"sex\",\"type\":\"int\",\"id\":\"11\",\"nullable\":true,\"optional\":true,\"metadata\":{}}]}";
-      ObjectMapper mapper = new ObjectMapper();
-      JsonNode jsonNode = mapper.readTree(value);
-      InternalSchema internalSchema = SerDeHelper.fromJson(jsonNode);
-      this.internalSchemaOption = Option.of(internalSchema);
-
-//      this.internalSchemaOption = schemaUtil.getTableInternalSchemaFromCommitMetadata();
+      boolean schemaEvolutionFullSchemaEnable =
+          job.getBoolean("hoodie.schema.evolution.fullschema.field.enable",false);
+      if (schemaEvolutionFullSchemaEnable) {
+        List<Long> commitInstants = getAllCompletedCommitInstantTime(metaClient);
+        commitInstants.add(0L);
+        Long startCommitTime = Long.valueOf(readStartCommitTime(job, metaClient.getTableConfig().getTableName()));
+        Integer maxCommit = readMaxCommits(job, metaClient.getTableConfig().getTableName());
+        int index = findIndexByStartInstant(commitInstants, startCommitTime);
+        if (index - maxCommit < 0) {
+          useLatestSchemaFromCommitMetadata();
+        } else {
+          Pair<List<Long>, List<JsonNode>> instantAndSchemasPair = parseChangeSchemaFromSchemaFile();
+          if (instantAndSchemasPair == null) {
+            LOG.warn("No schema change file found, will use the latest latest schema.");
+            useLatestSchemaFromCommitMetadata();
+          } else {
+            List<Long> instants = instantAndSchemasPair.getKey();
+            List<JsonNode> fieldArrNodes = instantAndSchemasPair.getValue();
+            int schemaIndex = findIndexByStartInstant(instants, commitInstants.get(index - maxCommit));
+            JsonNode schemaNode = fieldArrNodes.get(schemaIndex);
+            InternalSchema expectedInternalSchema = SerDeHelper.fromJson(schemaNode);
+            internalSchemaOption = Option.of(expectedInternalSchema);
+          }
+        }
+      } else {
+        useLatestSchemaFromCommitMetadata();
+      }
     } catch (Exception e) {
       internalSchemaOption = Option.empty();
       LOG.warn(String.format("failed to get internal Schema from hudi table：%s", metaClient.getBasePathV2()), e);
     }
     LOG.info(String.format("finish init schema evolution for split: %s", split));
+  }
+
+  private Pair<List<Long>, List<JsonNode>> parseChangeSchemaFromSchemaFile() throws IOException {
+    String schemaFolderName = metaClient.getSchemaFolderName();
+    FileSystem fs = FileSystem.get(metaClient.getHadoopConf());
+    Optional<Path> schemaFileOption = Arrays.stream(fs.listStatus(new Path(schemaFolderName)))
+        .filter(f -> f.isFile() && f.getPath().getName().endsWith(SCHEMA_COMMIT_ACTION))
+        .map(FileStatus::getPath)
+        .findFirst();
+    if (!schemaFileOption.isPresent()) {
+      return null;
+    }
+    FSDataInputStream fis = fs.open(schemaFileOption.get());
+    ObjectMapper mapper = new ObjectMapper();
+    ArrayNode schemaArrayNode = (ArrayNode) (mapper.readTree(fis).get("schemas"));
+    List<Long> instants = new ArrayList<>();
+    List<JsonNode> fieldArrNodes = new ArrayList<>();
+    for (JsonNode node : schemaArrayNode) {
+      Long instant = Long.valueOf(node.get("version_id").asText());
+      instants.add(instant);
+      fieldArrNodes.add(node);
+    }
+
+    return Pair.of(instants, fieldArrNodes);
+  }
+
+  private void useLatestSchemaFromCommitMetadata() {
+    TableSchemaResolver schemaUtil = new TableSchemaResolver(metaClient);
+    this.internalSchemaOption = schemaUtil.getTableInternalSchemaFromCommitMetadata();
+  }
+
+  private int findIndexByStartInstant(List<Long> commitInstants, long startInstantTs) {
+    int size = commitInstants.size();
+    int left = 0;
+    int right = size - 1;
+
+    while (left < right) {
+      int mid = (right - left) / 2 + left;
+      long instant = commitInstants.get(mid);
+      if (instant == startInstantTs) {
+        return mid;
+      } else if (instant > startInstantTs) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+
+    return right;
+  }
+
+
+  private List<Long> getAllCompletedCommitInstantTime(HoodieTableMetaClient metaClient) {
+    // TODO 是否需要考虑 archive timeline
+    return metaClient.getActiveTimeline().filterCompletedInstants().getInstants().stream()
+        .sorted(Comparator.comparing(HoodieInstant::getTimestamp).reversed())
+        .map(HoodieInstant::getTimestamp).map(Long::parseLong).collect(Collectors.toList());
   }
 
   private HoodieTableMetaClient setUpHoodieTableMetaClient() throws IOException {

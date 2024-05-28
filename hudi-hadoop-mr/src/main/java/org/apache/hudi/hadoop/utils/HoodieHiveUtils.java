@@ -100,8 +100,12 @@ public class HoodieHiveUtils {
   }
 
   public static Integer readMaxCommits(JobContext job, String tableName) {
+    return readMaxCommits(job.getConfiguration(), tableName);
+  }
+
+  public static Integer readMaxCommits(Configuration conf, String tableName) {
     String maxCommitName = String.format(HOODIE_MAX_COMMIT_PATTERN, tableName);
-    int maxCommits = job.getConfiguration().getInt(maxCommitName, DEFAULT_MAX_COMMITS);
+    int maxCommits = conf.getInt(maxCommitName, DEFAULT_MAX_COMMITS);
     if (maxCommits == MAX_COMMIT_ALL) {
       maxCommits = Integer.MAX_VALUE;
     }
@@ -110,9 +114,13 @@ public class HoodieHiveUtils {
   }
 
   public static String readStartCommitTime(JobContext job, String tableName) {
+    return readStartCommitTime(job.getConfiguration(), tableName);
+  }
+
+  public static String readStartCommitTime(Configuration jobConf, String tableName) {
     String startCommitTimestampName = String.format(HOODIE_START_COMMIT_PATTERN, tableName);
-    LOG.info("Read start commit time - " + job.getConfiguration().get(startCommitTimestampName));
-    return job.getConfiguration().get(startCommitTimestampName);
+    LOG.info("Read start commit time - " + jobConf.get(startCommitTimestampName));
+    return jobConf.get(startCommitTimestampName);
   }
 
   /**
