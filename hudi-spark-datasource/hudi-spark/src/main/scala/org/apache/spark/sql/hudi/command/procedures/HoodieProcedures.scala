@@ -76,6 +76,7 @@ object HoodieProcedures {
       ,(ShowMetadataTableStatsProcedure.NAME, ShowMetadataTableStatsProcedure.builder)
       ,(ValidateMetadataTableFilesProcedure.NAME, ValidateMetadataTableFilesProcedure.builder)
       ,(ShowFsPathDetailProcedure.NAME, ShowFsPathDetailProcedure.builder)
+      ,(ShowFileStatusProcedure.NAME, ShowFileStatusProcedure.builder)
       ,(CopyToTableProcedure.NAME, CopyToTableProcedure.builder)
       ,(RepairAddpartitionmetaProcedure.NAME, RepairAddpartitionmetaProcedure.builder)
       ,(RepairCorruptedCleanFilesProcedure.NAME, RepairCorruptedCleanFilesProcedure.builder)
