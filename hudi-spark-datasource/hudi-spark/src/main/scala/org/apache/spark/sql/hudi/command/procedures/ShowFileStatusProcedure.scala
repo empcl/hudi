@@ -129,15 +129,11 @@ class ShowFileStatusProcedure extends BaseProcedure
 
       restoreMetadata.exists { metadata =>
         metadata.asScala.exists { rollbackMetadata =>
-          val partitionMetadata = rollbackMetadata.getPartitionMetadata
-          partition.map { p =>
-            if (partitionMetadata.get(p) == null) {
-              throw new HoodieException(s"Partition $p is not found in restore metadata")
-            }
-            partitionMetadata.get(p).getSuccessDeleteFiles.asScala.exists(_.contains(fileName))
-          } getOrElse {
-            partitionMetadata.values.iterator.asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
-          }
+          val partitionRollbackMetadata = rollbackMetadata.getPartitionMetadata
+          partition.flatMap(
+            p => Option.apply(partitionRollbackMetadata.get(p)).flatMap(
+              _.getSuccessDeleteFiles.asScala.find(_.contains(fileName)))).isDefined ||
+            partitionRollbackMetadata.values.iterator.asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
         }
       }
     }.map(restoreInstant =>
@@ -171,15 +167,11 @@ class ShowFileStatusProcedure extends BaseProcedure
     rollbackInstant.find { instant =>
       val rollbackMetadata =
         TimelineMetadataUtils.deserializeHoodieRollbackMetadata(timeline.getInstantDetails(instant).get())
-      val partitionMetadata = rollbackMetadata.getPartitionMetadata
-      partition.map { p =>
-        if (partitionMetadata.get(p) == null) {
-          throw new HoodieException(s"Partition $p is not found in rollback metadata")
-        }
-        partitionMetadata.get(p).getSuccessDeleteFiles.asScala.exists(_.contains(fileName))
-      }.getOrElse {
-        partitionMetadata.values.iterator.asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
-      }
+      val partitionRollbackMetadata = rollbackMetadata.getPartitionMetadata
+      partition.flatMap(
+        p => Option.apply(partitionRollbackMetadata.get(p)).flatMap(
+          _.getSuccessDeleteFiles.asScala.find(_.contains(fileName)))).isDefined ||
+        partitionRollbackMetadata.values.iterator.asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
     }.map(instant => getResult(timeline, HoodieTimeline.ROLLBACK_ACTION, instant.getTimestamp).get)
   }
 
@@ -199,15 +191,9 @@ class ShowFileStatusProcedure extends BaseProcedure
     cleanedInstant.find { instant =>
       val cleanMetadata = TimelineMetadataUtils.deserializeHoodieCleanMetadata(
         timeline.getInstantDetails(instant).get())
-      val partitionMetadata = cleanMetadata.getPartitionMetadata
-      partition.map { p =>
-        if (partitionMetadata.get(p) == null) {
-          throw new HoodieException(s"Partition $p is not found in clean metadata")
-        }
-        partitionMetadata.get(p).getSuccessDeleteFiles.asScala.exists(_.contains(fileName))
-      } getOrElse {
-        partitionMetadata.values().iterator().asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
-      }
+      val partitionCleanMetadata = cleanMetadata.getPartitionMetadata
+      partition.flatMap(p => Option.apply(partitionCleanMetadata.get(p)).flatMap(_.getSuccessDeleteFiles.asScala.find(_.contains(fileName)))).isDefined ||
+        partitionCleanMetadata.values.iterator.asScala.exists(_.getSuccessDeleteFiles.asScala.exists(_.contains(fileName)))
     }.map(instant => getResult(timeline, HoodieTimeline.CLEAN_ACTION, instant.getTimestamp).get)
   }
 

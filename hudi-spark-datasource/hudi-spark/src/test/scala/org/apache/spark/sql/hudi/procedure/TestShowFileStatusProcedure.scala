@@ -86,7 +86,7 @@ class TestShowFileStatusProcedure extends HoodieSparkProcedureTestBase {
           Seq(FileStatus.DELETED.toString, HoodieTimeline.CLEAN_ACTION, metaClient.reloadActiveTimeline().getCleanerTimeline.lastInstant().get.getTimestamp, TimelineType.ACTIVE.toString, DEFAULT_VALUE)
         )
 
-        spark.sql(s"insert into $tableName values(3, 'a3', 10, 1002, 1000)")
+        spark.sql(s"insert into $tableName values(3, 'a3', 10, 1002, 1001)")
         // clustering / compaction
         val newInstant = client.createNewInstantTime()
         if (tableType.equals("cow")) {
@@ -104,7 +104,7 @@ class TestShowFileStatusProcedure extends HoodieSparkProcedureTestBase {
         val savepointTime: String = getSpecifyActionLatestTime(fs, basePath, newInstant, 1).get
         spark.sql(s"call create_savepoint(table => '$tableName', commit_time => '$savepointTime')")
         spark.sql(s"insert into $tableName values(2, 'a2', 11, 1002, 1000)")
-        spark.sql(s"insert into $tableName values(6, 'a6', 10, 1000, 1000)")
+        spark.sql(s"insert into $tableName values(6, 'a6', 10, 1000, 1001)")
 
         // restore
         before = getAllDataFile(fs, basePath, Option.apply(partition))
